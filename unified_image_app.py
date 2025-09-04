@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Streamlit Web App — Raster → Vector (B/W) for pen plotters / wall painting robots
+Unified Streamlit App — Photo Editor + Raster→Vector (Plotter)
 
-• Python backend (OpenCV + scikit-image) with a reactive web UI (Streamlit)
-• Upload an image and tune parameters; previews update automatically
-• Shows Original, Grayscale, and After (vector preview) side-by-side
-• Download clean SVG polylines (mm units) for downstream G-code tools
-• Progress bar reflects each stage of computation
+• One app with two big features you can switch between from the sidebar
+  1) Photo Editor (Lightroom‑style controls) — live preview
+  2) Raster → Vector (B/W) for pen plotters — live preview + SVG download
+
+Design
+- Sliders/toggles on the LEFT (sidebar), image previews in the MIDDLE columns
+- A progress bar shows the computation stage on every change
+- Uses Python end‑to‑end (OpenCV, NumPy, scikit‑image)
 
 Run locally
 -----------
 1) Install deps (Python 3.9+ recommended):
    pip install streamlit opencv-python scikit-image svgwrite numpy pillow
 
-2) Start the app:
-   streamlit run streamlit_raster_to_vector_app.py
+2) Start:
+   streamlit run unified_image_app.py
 
-3) Open the browser page that Streamlit prints (usually http://localhost:8501)
+Notes
+- This is a practical, offline‑friendly approximation of classic tools.
+- Local adjustment tools here include Radial & Graduated filters. A free‑hand brush
+  and AI subject/sky masks are not provided in this offline sample.
 """
 
 from __future__ import annotations
@@ -39,10 +45,18 @@ Point = Tuple[int, int]
 FloatPoint = Tuple[float, float]
 Polyline = List[FloatPoint]
 
-# -------------------------- Image utilities ----------------------------------
+# ============================== Utility Helpers ==============================
+
+def _ensure_uint8(img: np.ndarray) -> np.ndarray:
+    img = np.clip(img, 0, 255)
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
+    return img
+
+def _to_bgr(img: np.ndarray) -> np.ndarray:
+    return img if img.ndim == 3 and img.shape[2] == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
 def load_image_to_bgr(file) -> np.ndarray:
-    """Read uploaded file-like object into BGR numpy image."""
     data = file.read()
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -56,6 +70,254 @@ def ensure_max_side(img: np.ndarray, max_side: int) -> np.ndarray:
         return img
     s = max_side / max(h, w)
     return cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
+
+# =============================== Photo Editor ================================
+
+# --- Basic global adjustments ---
+
+def apply_basic(img_bgr: np.ndarray,
+                exposure: float, contrast: float,
+                highlights: float, shadows: float,
+                whites: float, blacks: float) -> np.ndarray:
+    # Convert to float for math
+    img = img_bgr.astype(np.float32) / 255.0
+    # Exposure: scale around mid-gray
+    img = np.clip(img * (2.0 ** exposure), 0, 1)
+    # Contrast: simple S-curve via gamma-like adjustment around 0.5
+    c = contrast
+    if abs(c) > 1e-6:
+        # map [-1,1] → gamma in [0.5, 2]
+        gamma = 1.0 / (1.0 + c) if c > 0 else 1.0 - c*0.5
+        img = np.clip((img ** gamma), 0, 1)
+    # Convert to Lab to work on luminance for highlights/shadows/whites/blacks
+    lab = cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = lab[...,0], lab[...,1], lab[...,2]
+    Ln = L / 255.0
+    # Highlights/Shadows tone curve (simple sigmoid blends)
+    if abs(highlights) > 1e-6:
+        mask_h = np.clip((Ln - 0.5)*2, 0, 1)
+        L = L + highlights*50.0*mask_h
+    if abs(shadows) > 1e-6:
+        mask_s = np.clip((0.5 - Ln)*2, 0, 1)
+        L = L + shadows*50.0*mask_s
+    # Whites/Blacks: push top/bottom ends
+    if abs(whites) > 1e-6:
+        L = np.clip(L + whites*40.0*np.power(np.clip(L/255.0,0,1), 2.0), 0, 255)
+    if abs(blacks) > 1e-6:
+        L = np.clip(L + blacks*40.0*np.power(1.0 - np.clip(L/255.0,0,1), 2.0), 0, 255)
+    lab = np.stack([np.clip(L,0,255), A, B], axis=-1)
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out
+
+# --- White balance & color ---
+
+def apply_white_balance(img_bgr: np.ndarray, temp: float, tint: float) -> np.ndarray:
+    # temp: [-100,100] warm/cool, tint: [-100,100] magenta/green
+    img = img_bgr.astype(np.float32)
+    # White balance gains (simple linear gains per channel)
+    # Map temp to blue/red gains; tint to green/magenta
+    r_gain = 1.0 + 0.01*temp
+    b_gain = 1.0 - 0.01*temp
+    g_gain = 1.0 + 0.01*tint
+    gains = np.array([b_gain, g_gain, r_gain], dtype=np.float32)
+    out = img * gains
+    return _ensure_uint8(out)
+
+def apply_vibrance_saturation(img_bgr: np.ndarray, vibrance: float, saturation: float) -> np.ndarray:
+    # Convert to HSV
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    H,S,V = hsv[...,0], hsv[...,1], hsv[...,2]
+    # Vibrance: boost saturation more for low‑sat pixels
+    if abs(vibrance) > 1e-6:
+        factor = 1.0 + (vibrance/100.0) * (1.0 - (S/255.0))
+        S = np.clip(S * factor, 0, 255)
+    if abs(saturation) > 1e-6:
+        S = np.clip(S * (1.0 + saturation/100.0), 0, 255)
+    hsv = np.stack([H,S,V], axis=-1)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.ndarray:
+    # HSL per hue bucket (reds, oranges, yellows, greens, aquas, blues, purples, magentas)
+    # Convert to HLS (OpenCV uses HLS not HSL; similar)
+    hls = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HLS).astype(np.float32)
+    H,L,S = hls[...,0], hls[...,1], hls[...,2]
+    Hn = (H * 2.0)  # OpenCV H in [0,180]; map to [0,360)
+    # Define hue ranges
+    ranges = {
+        'reds': [(345,360),(0,15)],
+        'oranges': [(15,45)],
+        'yellows': [(45,75)],
+        'greens': [(75,165)],
+        'aquas': [(165,195)],
+        'blues': [(195,255)],
+        'purples': [(255,285)],
+        'magentas': [(285,345)],
+    }
+    mask_total = np.zeros_like(H, dtype=np.float32)
+    H2 = Hn
+    for name, spans in ranges.items():
+        m = np.zeros_like(H, dtype=np.uint8)
+        for a,b in spans:
+            if a <= b:
+                m |= ((H2 >= a) & (H2 < b)).astype(np.uint8)
+            else: # wrap
+                m |= ((H2 >= a) | (H2 < b)).astype(np.uint8)
+        if name in h_adj:
+            H2 = (H2 + m*h_adj[name]) % 360
+        if name in s_adj:
+            S = np.clip(S * (1.0 + (m*s_adj[name]/100.0)), 0, 255)
+        if name in l_adj:
+            L = np.clip(L + (m*l_adj[name]), 0, 255)
+        mask_total += m
+    H_out = (H2/2.0).astype(np.float32)
+    out = cv2.cvtColor(np.stack([H_out,L,S], axis=-1).astype(np.uint8), cv2.COLOR_HLS2BGR)
+    return out
+
+# --- Detail & sharpness ---
+
+def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, texture: float, clarity: float, dehaze: float) -> np.ndarray:
+    img = img_bgr.astype(np.float32)
+    # Noise reduction (luma) via bilateral or fastNlMeans
+    if noise_red > 0:
+        h = 5 + int(noise_red*3)
+        img = cv2.fastNlMeansDenoisingColored(_ensure_uint8(img), None, h, h, 7, 21).astype(np.float32)
+    # Clarity: local contrast via unsharp on midtones
+    if abs(clarity) > 1e-6:
+        l = cv2.cvtColor(_ensure_uint8(img), cv2.COLOR_BGR2LAB).astype(np.float32)
+        L = l[...,0]
+        blur = cv2.GaussianBlur(L, (0,0), 3)
+        high = L - blur
+        L = np.clip(L + clarity*high, 0, 255)
+        l[...,0] = L
+        img = cv2.cvtColor(l.astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+    # Texture: high‑frequency boost
+    if abs(texture) > 1e-6:
+        blur = cv2.GaussianBlur(_ensure_uint8(img), (0,0), 1.0)
+        high = _ensure_uint8(img) - blur
+        img = np.clip(img + texture*high, 0, 255)
+    # Sharpening: unsharp mask
+    if sharpening > 0:
+        sigma = 1.0 + 2.0*sharpening
+        blur = cv2.GaussianBlur(_ensure_uint8(img), (0,0), sigma)
+        img = np.clip(1.5*_ensure_uint8(img) - 0.5*blur, 0, 255)
+    # Dehaze: simple contrast‑limited stretch in HSV V channel
+    if abs(dehaze) > 1e-6:
+        hsv = cv2.cvtColor(_ensure_uint8(img), cv2.COLOR_BGR2HSV).astype(np.float32)
+        V = hsv[...,2]
+        alpha = 1.0 + 0.02*dehaze
+        beta = -10.0 * (dehaze/100.0)
+        V = np.clip(V*alpha + beta, 0, 255)
+        hsv[...,2] = V
+        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+    return _ensure_uint8(img)
+
+# --- Crop, rotate, aspect ---
+
+def apply_crop_rotate(img_bgr: np.ndarray, angle_deg: float,
+                      crop_l: float, crop_r: float, crop_t: float, crop_b: float,
+                      target_aspect: float|None) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    # Rotate around center
+    if abs(angle_deg) > 1e-3:
+        M = cv2.getRotationMatrix2D((w/2, h/2), angle_deg, 1.0)
+        img_bgr = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    # Crop by relative margins
+    x0 = int(w*crop_l/100.0)
+    x1 = int(w*(1.0 - crop_r/100.0))
+    y0 = int(h*crop_t/100.0)
+    y1 = int(h*(1.0 - crop_b/100.0))
+    x0,x1 = max(0,x0), max(x0+1,min(w,x1))
+    y0,y1 = max(0,y0), max(y0+1,min(h,y1))
+    img_bgr = img_bgr[y0:y1, x0:x1]
+    # Aspect ratio fit (optional)
+    if target_aspect and img_bgr.size:
+        hh, ww = img_bgr.shape[:2]
+        cur = ww/float(hh)
+        if abs(cur - target_aspect) > 1e-3:
+            if cur > target_aspect:  # too wide → crop width
+                new_w = int(target_aspect*hh)
+                off = (ww - new_w)//2
+                img_bgr = img_bgr[:, off:off+new_w]
+            else:                     # too tall → crop height
+                new_h = int(ww/target_aspect)
+                off = (hh - new_h)//2
+                img_bgr = img_bgr[off:off+new_h, :]
+    return img_bgr
+
+# --- Lens & geometry corrections (simple) ---
+
+def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float, distortion: float,
+                        persp_x: float, persp_y: float) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    out = img_bgr.copy()
+    # Vignetting correction (radial brighten/darken)
+    if abs(vignetting) > 1e-6:
+        Y, X = np.ogrid[:h, :w]
+        cx, cy = w/2, h/2
+        r = np.sqrt((X-cx)**2 + (Y-cy)**2)
+        r /= r.max()
+        mask = 1.0 + vignetting/100.0 * (1 - r)
+        out = np.clip(out.astype(np.float32) * mask[...,None], 0, 255).astype(np.uint8)
+    # Chromatic aberration: shift channels
+    if abs(ca_shift) > 1e-6:
+        shift = int(round(ca_shift))
+        def shift_channel(ch, dx, dy):
+            M = np.float32([[1,0,dx],[0,1,dy]])
+            return cv2.warpAffine(ch, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+        b,g,r = cv2.split(out)
+        out = cv2.merge([shift_channel(b,-shift,0), g, shift_channel(r,shift,0)])
+    # Barrel/Pincushion distortion (single k1 parameter)
+    if abs(distortion) > 1e-6:
+        k1 = distortion/10000.0
+        xx, yy = np.meshgrid(np.linspace(-1,1,w), np.linspace(-1,1,h))
+        rr = xx*xx + yy*yy
+        x_dist = xx*(1 + k1*rr)
+        y_dist = yy*(1 + k1*rr)
+        map_x = ((x_dist + 1)*0.5*(w-1)).astype(np.float32)
+        map_y = ((y_dist + 1)*0.5*(h-1)).astype(np.float32)
+        out = cv2.remap(out, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    # Perspective (keystone) simple warp
+    if abs(persp_x) > 1e-6 or abs(persp_y) > 1e-6:
+        dx = w * persp_x / 100.0
+        dy = h * persp_y / 100.0
+        src = np.float32([[0,0],[w,0],[w,h],[0,h]])
+        dst = np.float32([[0+dx,0+dy],[w-dx,0+dy],[w-dx,h-dy],[0+dx,h-dy]])
+        M = cv2.getPerspectiveTransform(src, dst)
+        out = cv2.warpPerspective(out, M, (w,h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return out
+
+# --- Local adjustments: radial & graduated filters ---
+
+def apply_radial_filter(img_bgr: np.ndarray, cx: float, cy: float, rx: float, ry: float, strength: float) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    Y, X = np.ogrid[:h, :w]
+    cxp, cyp = w*cx, h*cy
+    rxs, rys = max(1,w*rx), max(1,h*ry)
+    mask = (((X-cxp)/rxs)**2 + ((Y-cyp)/rys)**2)
+    mask = np.clip(1.0 - mask, 0.0, 1.0)
+    mask = cv2.GaussianBlur(mask, (0,0), 15)
+    # Brightness exposure style
+    factor = 1.0 + strength/100.0
+    out = img_bgr.astype(np.float32)
+    out = out*(1-mask[...,None]) + np.clip(out*factor,0,255)*mask[...,None]
+    return _ensure_uint8(out)
+
+def apply_graduated_filter(img_bgr: np.ndarray, angle_deg: float, pos: float, feather: float, strength: float) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    Y, X = np.mgrid[0:h, 0:w].astype(np.float32)
+    # Create a gradient mask line at position pos from top (0..1)
+    theta = np.deg2rad(angle_deg)
+    nx, ny = np.cos(theta), np.sin(theta)
+    # line passing through (w/2, h*pos)
+    d = (X - w/2)*nx + (Y - h*pos)*ny
+    mask = 0.5 - d / (max(w,h) * (feather/100.0) + 1e-6)
+    mask = np.clip(mask, 0, 1)
+    factor = 1.0 + strength/100.0
+    out = img_bgr.astype(np.float32)
+    out = out*(1-mask[...,None]) + np.clip(out*factor,0,255)*mask[...,None]
+    return _ensure_uint8(out)
+
+# ============================ Raster→Vector bits =============================
 
 def to_grayscale(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -80,17 +342,13 @@ def threshold_bw(gray: np.ndarray,
         th = cv2.bitwise_not(th)
     return th
 
-# ------------------------------ Geometry -------------------------------------
+# --- Geometry helpers for vectorization ---
 
 def polyline_length_px(poly: Sequence[FloatPoint]) -> float:
     if len(poly) < 2:
         return 0.0
-    return float(sum(
-        math.hypot(poly[i+1][0]-poly[i][0], poly[i+1][1]-poly[i][1])
-        for i in range(len(poly)-1)
-    ))
-
-# Outline mode
+    return float(sum(math.hypot(poly[i+1][0]-poly[i][0], poly[i+1][1]-poly[i][1])
+                     for i in range(len(poly)-1)))
 
 def find_outline_polylines(binary: np.ndarray,
                            simplify_eps_px: float,
@@ -110,7 +368,7 @@ def find_outline_polylines(binary: np.ndarray,
             polylines.append(pts)
     return polylines
 
-# Centerline mode helpers
+# centerline
 
 def neighbors8(p: Point) -> List[Point]:
     x, y = p
@@ -123,7 +381,7 @@ def neighbors8(p: Point) -> List[Point]:
 def build_adjacency_from_skeleton(skel: np.ndarray) -> Dict[Point, List[Point]]:
     h, w = skel.shape
     on = np.argwhere(skel > 0)
-    on_set: Set[Point] = set((int(x), int(y)) for y, x in on)  # (x,y)
+    on_set: Set[Point] = set((int(x), int(y)) for y, x in on)
     adj: Dict[Point, List[Point]] = {}
     for x, y in on_set:
         nbrs: List[Point] = []
@@ -254,12 +512,9 @@ def nearest_order(polys: List[Polyline]) -> List[Polyline]:
     return ordered
 
 def svg_bytes(polylines: List[Polyline],
-              img_w: int,
-              img_h: int,
-              width_mm: float,
-              height_mm: float | None,
-              margin_mm: float,
-              stroke_mm: float,
+              img_w: int, img_h: int,
+              width_mm: float, height_mm: float | None,
+              margin_mm: float, stroke_mm: float,
               optimize_order_flag: bool) -> bytes:
     if not polylines:
         raise RuntimeError("No vector paths generated. Adjust parameters.")
@@ -275,54 +530,34 @@ def svg_bytes(polylines: List[Polyline],
     actual_h = img_h * s
     offx = (width_mm - actual_w) / 2.0
     offy = (height_mm - actual_h) / 2.0
-    dwg = svgwrite.Drawing(size=(f"{width_mm}mm", f"{height_mm}mm"),
-                           viewBox=f"0 0 {width_mm} {height_mm}")
+    dwg = svgwrite.Drawing(size=(f"{width_mm}mm", f"{height_mm}mm"), viewBox=f"0 0 {width_mm} {height_mm}")
     for poly in polys:
         if len(poly) < 2:
             continue
         pts_mm = [(offx + p[0]*s, offy + p[1]*s) for p in poly]
         dwg.add(dwg.polyline(points=pts_mm,
-                             stroke="#000",
-                             fill="none",
+                             stroke="#000", fill="none",
                              stroke_width=f"{stroke_mm}mm",
-                             stroke_linecap="round",
-                             stroke_linejoin="round"))
+                             stroke_linecap="round", stroke_linejoin="round"))
     return dwg.tostring().encode("utf-8")
 
-# ---------------------------- Vectorization stepper ---------------------------
+# Vectorization stepper with progress
 
-def vectorize_with_progress(gray: np.ndarray,
-                            progress_cb,
-                            *,
-                            mode: str,
-                            thr_method: str,
-                            invert: bool,
-                            blur_ksize: int,
-                            block_size: int,
-                            C: int,
-                            width_mm: float,
-                            height_mm_opt: float,
-                            margin_mm: float,
-                            simplify_eps_mm: float,
-                            min_len_mm: float,
-                            stroke_mm: float,
-                            optimize: bool):
-    """Return (binary, polylines, preview_img_bgr, svg_bytes)."""
-
-    # Step 1: threshold
+def vectorize_with_progress(gray: np.ndarray, progress_cb, *,
+                            mode: str, thr_method: str, invert: bool, blur_ksize: int,
+                            block_size: int, C: int,
+                            width_mm: float, height_mm_opt: float, margin_mm: float,
+                            simplify_eps_mm: float, min_len_mm: float,
+                            stroke_mm: float, optimize: bool):
     progress_cb(10, "Thresholding…")
     binary = threshold_bw(gray, method=thr_method, block_size=block_size, C=C,
-                          invert=invert, blur_ksize=blur_ksize, use_otsu=(thr_method == "otsu"))
-
-    # Step 2: compute px-per-mm for geometric params
+                          invert=invert, blur_ksize=blur_ksize, use_otsu=(thr_method=="otsu"))
     progress_cb(25, "Preparing geometry…")
     h, w = gray.shape
     avail_w = max(1e-6, width_mm - 2*margin_mm)
     px_per_mm = w / avail_w
     simplify_eps_px = max(0.0, simplify_eps_mm * px_per_mm)
     min_len_px = max(0.0, min_len_mm * px_per_mm)
-
-    # Step 3: vectorization
     if mode == "outline":
         progress_cb(55, "Tracing contours…")
         polylines = find_outline_polylines(binary, simplify_eps_px, min_len_px)
@@ -333,102 +568,210 @@ def vectorize_with_progress(gray: np.ndarray,
         skel = skeletonize(binary > 0).astype(np.uint8) * 255
         progress_cb(65, "Tracing centerlines…")
         polylines = trace_skeleton_to_polylines(skel, simplify_eps_px, min_len_px)
-
-    # Step 4: preview rendering
     progress_cb(80, "Rendering preview…")
     preview = np.zeros((h, w, 3), dtype=np.uint8)
     px_thick = max(1, int(round(stroke_mm * 2)))
     for poly in polylines:
         if len(poly) >= 2:
             pts = np.array(poly, dtype=np.int32)
-            cv2.polylines(preview, [pts], isClosed=False, color=(255, 255, 255), thickness=px_thick)
-
-    # Step 5: SVG
+            cv2.polylines(preview, [pts], isClosed=False, color=(255,255,255), thickness=px_thick)
     progress_cb(95, "Building SVG…")
     height_mm = None if height_mm_opt <= 0 else height_mm_opt
     svg = svg_bytes(polylines, w, h, width_mm, height_mm, margin_mm, stroke_mm, optimize)
-
     progress_cb(100, "Done")
     return binary, polylines, preview, svg
 
-# --------------------------------- UI ----------------------------------------
+# ================================ UI LAYOUT ==================================
 
-st.set_page_config(page_title="Raster → Vector (Plotter)", layout="wide")
-st.title("Raster → Vector (B/W) — Plotter-friendly Web App")
+st.set_page_config(page_title="Unified Image App", layout="wide")
+st.title("Unified Image App — Photo Editor & Raster→Vector")
 
 with st.sidebar:
-    st.header("Input & Quality")
-    uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
-    max_side = st.slider("Resize longest side (px)", 400, 4000, 1400, 100,
-                         help="Larger = more detail but slower.")
+    st.header("Choose Feature")
+    app_mode = st.radio("Application", ["Photo Editor", "Raster → Vector"], index=0)
+    st.divider()
 
-    st.header("Vectorization")
-    mode = st.radio("Mode", ["centerline","outline"], index=0, help="Centerline=skeleton; Outline=contours")
-    thr_method = st.radio("Threshold", ["adaptive","otsu"], index=0)
-    invert = st.checkbox("Invert", value=False)
-    blur_ksize = st.slider("Blur ksize", 0, 15, 3, 1)
-    block_size = st.slider("Adaptive block size (odd)", 3, 101, 35, 2)
-    C = st.slider("Adaptive C", -30, 30, 10, 1)
+# ------------------------------- PHOTO EDITOR --------------------------------
+if app_mode == "Photo Editor":
+    with st.sidebar:
+        st.subheader("Input")
+        uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
+        max_side = st.slider("Resize longest side (px)", 400, 4000, 1600, 100)
+        st.subheader("Basic Adjustments")
+        exposure = st.slider("Exposure (EV)", -2.0, 2.0, 0.0, 0.05)
+        contrast = st.slider("Contrast", -0.9, 0.9, 0.0, 0.01)
+        highlights = st.slider("Highlights", -1.0, 1.0, 0.0, 0.01)
+        shadows = st.slider("Shadows", -1.0, 1.0, 0.0, 0.01)
+        whites = st.slider("Whites", -1.0, 1.0, 0.0, 0.01)
+        blacks = st.slider("Blacks", -1.0, 1.0, 0.0, 0.01)
 
-    st.header("Geometry / Export (mm)")
-    width_mm = st.slider("Width", 100, 2000, 800, 10)
-    height_mm_opt = st.slider("Height (0=auto)", 0, 2000, 0, 10)
-    margin_mm = st.slider("Margin", 0, 100, 10, 1)
-    stroke_mm = st.slider("Stroke preview", 0.0, 2.0, 0.35, 0.05)
+        st.subheader("Color Adjustments")
+        temp = st.slider("Temp", -100, 100, 0, 1)
+        tint = st.slider("Tint", -100, 100, 0, 1)
+        vibrance = st.slider("Vibrance", -100, 100, 0, 1)
+        saturation = st.slider("Saturation", -100, 100, 0, 1)
+        with st.expander("HSL / Color Mixer"):
+            h_adj = {}
+            s_adj = {}
+            l_adj = {}
+            for name in ["reds","oranges","yellows","greens","aquas","blues","purples","magentas"]:
+                st.caption(name.title())
+                h_adj[name] = st.slider(f"{name} hue", -45, 45, 0, 1, key=f"h_{name}")
+                s_adj[name] = st.slider(f"{name} sat", -100, 100, 0, 1, key=f"s_{name}")
+                l_adj[name] = st.slider(f"{name} lum", -50, 50, 0, 1, key=f"l_{name}")
 
-    st.header("Simplify / Filter")
-    simplify_eps_mm = st.slider("Simplify epsilon", 0.0, 5.0, 0.5, 0.05, help="Higher = fewer nodes")
-    min_len_mm = st.slider("Min path length", 0.0, 20.0, 2.0, 0.5)
-    optimize = st.checkbox("Optimize pen-up travel", value=True)
+        st.subheader("Detail & Sharpness")
+        sharpening = st.slider("Sharpening", 0.0, 3.0, 0.0, 0.05)
+        noise_red = st.slider("Noise Reduction", 0.0, 3.0, 0.0, 0.05)
+        texture = st.slider("Texture", -1.0, 1.0, 0.0, 0.05)
+        clarity = st.slider("Clarity", -1.0, 1.0, 0.0, 0.05)
+        dehaze = st.slider("Dehaze", -50.0, 50.0, 0.0, 1.0)
 
-# Main preview area
-col1, col2, col3 = st.columns(3)
+        st.subheader("Crop & Straighten")
+        angle = st.slider("Angle/Level", -15.0, 15.0, 0.0, 0.1)
+        crop_l = st.slider("Crop Left %", 0.0, 40.0, 0.0, 0.5)
+        crop_r = st.slider("Crop Right %", 0.0, 40.0, 0.0, 0.5)
+        crop_t = st.slider("Crop Top %", 0.0, 40.0, 0.0, 0.5)
+        crop_b = st.slider("Crop Bottom %", 0.0, 40.0, 0.0, 0.5)
+        aspect = st.selectbox("Aspect Ratio", ["Original","1:1","4:5","3:2","16:9"]) 
+        aspect_map = {"Original": None, "1:1": 1.0, "4:5": 4/5, "3:2": 3/2, "16:9": 16/9}
+        target_aspect = aspect_map[aspect]
 
-if uploaded is None:
-    col1.info("Upload an image to begin")
+        st.subheader("Lens & Geometry")
+        vignetting = st.slider("Vignetting correction", -100.0, 100.0, 0.0, 1.0)
+        ca_shift = st.slider("Chromatic Aberration shift (px)", -5.0, 5.0, 0.0, 0.1)
+        distortion = st.slider("Barrel/Pincushion (k1×1e4)", -50.0, 50.0, 0.0, 1.0)
+        persp_x = st.slider("Perspective X %", -20.0, 20.0, 0.0, 0.1)
+        persp_y = st.slider("Perspective Y %", -20.0, 20.0, 0.0, 0.1)
+
+        st.subheader("Local Adjustments")
+        with st.expander("Radial Filter"):
+            cx = st.slider("Center X", 0.0, 1.0, 0.5, 0.01)
+            cy = st.slider("Center Y", 0.0, 1.0, 0.5, 0.01)
+            rx = st.slider("Radius X", 0.05, 1.0, 0.35, 0.01)
+            ry = st.slider("Radius Y", 0.05, 1.0, 0.25, 0.01)
+            radial_strength = st.slider(
+    "Exposure Strength (Radial)", -100.0, 100.0, 0.0, 1.0, key="pe_radial_strength"
+)
+        with st.expander("Graduated Filter"):
+            grad_angle = st.slider("Angle", -180.0, 180.0, 0.0, 1.0)
+            grad_pos = st.slider("Position (0=top)", 0.0, 1.0, 0.5, 0.01)
+            grad_feather = st.slider("Feather %", 1.0, 100.0, 50.0, 1.0)
+            grad_strength = st.slider(
+    "Exposure Strength (Graduated)", -100.0, 100.0, 0.0, 1.0, key="pe_grad_strength"
+)
+
+    col1, col2 = st.columns(2)
+    pbar = st.progress(0, text="Waiting for image…")
+
+    if uploaded is None:
+        col1.info("Upload an image to begin")
+    else:
+        def step(p, msg):
+            pbar.progress(p, text=msg)
+
+        step(5, "Loading image…")
+        img0 = ensure_max_side(load_image_to_bgr(uploaded), max_side)
+        col1.subheader("Original")
+        col1.image(cv2.cvtColor(img0, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+        step(15, "Basic adjustments…")
+        img = apply_basic(img0, exposure, contrast, highlights, shadows, whites, blacks)
+
+        step(30, "White balance & color…")
+        img = apply_white_balance(img, temp, tint)
+        img = apply_vibrance_saturation(img, vibrance, saturation)
+        img = apply_hsl(img, h_adj, s_adj, l_adj)
+
+        step(55, "Detail & sharpness…")
+        img = apply_detail(img, sharpening, noise_red, texture, clarity, dehaze)
+
+        step(70, "Lens & geometry…")
+        img = apply_lens_geometry(img, vignetting, ca_shift, distortion, persp_x, persp_y)
+
+        step(82, "Local adjustments…")
+        if abs(radial_strength) > 1e-6:
+            img = apply_radial_filter(img, cx, cy, rx, ry, radial_strength)
+        if abs(grad_strength) > 1e-6:
+            img = apply_graduated_filter(img, grad_angle, grad_pos, grad_feather, grad_strength)
+
+        step(90, "Crop & straighten…")
+        img = apply_crop_rotate(img, angle, crop_l, crop_r, crop_t, crop_b, target_aspect)
+
+        step(100, "Done")
+        col2.subheader("Edited")
+        col2.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+# ------------------------------ RASTER→VECTOR --------------------------------
 else:
-    pbar = st.progress(0, text="Starting…")
+    with st.sidebar:
+        st.subheader("Input & Quality")
+        uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"]) 
+        max_side = st.slider("Resize longest side (px)", 400, 4000, 1400, 100,
+                             help="Larger = more detail but slower.")
 
-    def step(pct, msg):
-        pbar.progress(pct, text=msg)
+        st.subheader("Vectorization")
+        mode = st.radio("Mode", ["centerline","outline"], index=0, help="Centerline=skeleton; Outline=contours")
+        thr_method = st.radio("Threshold", ["adaptive","otsu"], index=0)
+        invert = st.checkbox("Invert", value=False)
+        blur_ksize = st.slider("Blur ksize", 0, 15, 3, 1)
+        block_size = st.slider("Adaptive block size (odd)", 3, 101, 35, 2)
+        C = st.slider("Adaptive C", -30, 30, 10, 1)
 
-    img_bgr = load_image_to_bgr(uploaded)
-    img_bgr = ensure_max_side(img_bgr, max_side)
-    gray = to_grayscale(img_bgr)
+        st.subheader("Geometry / Export (mm)")
+        width_mm = st.slider("Width", 100, 2000, 800, 10)
+        height_mm_opt = st.slider("Height (0=auto)", 0, 2000, 0, 10)
+        margin_mm = st.slider("Margin", 0, 100, 10, 1)
+        stroke_mm = st.slider("Stroke preview", 0.0, 2.0, 0.35, 0.05)
 
-    # Show Original & Gray immediately
-    col1.subheader("Original")
-    col1.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.subheader("Simplify / Filter")
+        simplify_eps_mm = st.slider("Simplify epsilon", 0.0, 5.0, 0.5, 0.05,
+                                    help="Higher = fewer nodes")
+        min_len_mm = st.slider("Min path length", 0.0, 20.0, 2.0, 0.5)
+        optimize = st.checkbox("Optimize pen-up travel", value=True)
 
-    col2.subheader("Grayscale")
-    col2.image(gray, clamp=True, use_container_width=True)
+    col1, col2, col3 = st.columns(3)
+    pbar = st.progress(0, text="Waiting for image…")
 
-    try:
-        binary, polylines, preview, svg = vectorize_with_progress(
-            gray, step,
-            mode=mode,
-            thr_method=thr_method,
-            invert=invert,
-            blur_ksize=blur_ksize,
-            block_size=block_size if block_size % 2 == 1 else block_size + 1,
-            C=C,
-            width_mm=width_mm,
-            height_mm_opt=height_mm_opt,
-            margin_mm=margin_mm,
-            simplify_eps_mm=simplify_eps_mm,
-            min_len_mm=min_len_mm,
-            stroke_mm=stroke_mm,
-            optimize=optimize,
-        )
+    if uploaded is None:
+        col1.info("Upload an image to begin")
+    else:
+        def step(pct, msg):
+            pbar.progress(pct, text=msg)
 
-        col3.subheader("After (Vector preview)")
-        col3.image(preview, channels="BGR", use_container_width=True)
+        img_bgr = ensure_max_side(load_image_to_bgr(uploaded), max_side)
+        gray = to_grayscale(img_bgr)
 
-        st.divider()
-        st.download_button("⬇️ Download SVG", data=svg, file_name="vectorized.svg",
-                           mime="image/svg+xml")
-        st.caption(f"Paths: {len(polylines)}  ·  Image: {gray.shape[1]}×{gray.shape[0]} px")
-    except Exception as e:
-        st.error(str(e))
-    finally:
-        pbar.progress(100, text="Ready")
+        col1.subheader("Original")
+        col1.image(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+        col2.subheader("Grayscale")
+        col2.image(gray, clamp=True, use_container_width=True)
+
+        try:
+            binary, polylines, preview, svg = vectorize_with_progress(
+                gray, step,
+                mode=mode,
+                thr_method=thr_method,
+                invert=invert,
+                blur_ksize=blur_ksize,
+                block_size=block_size if block_size % 2 == 1 else block_size + 1,
+                C=C,
+                width_mm=width_mm,
+                height_mm_opt=height_mm_opt,
+                margin_mm=margin_mm,
+                simplify_eps_mm=simplify_eps_mm,
+                min_len_mm=min_len_mm,
+                stroke_mm=stroke_mm,
+                optimize=optimize,
+            )
+            col3.subheader("After (Vector preview)")
+            col3.image(preview, channels="BGR", use_container_width=True)
+            st.divider()
+            st.download_button("⬇️ Download SVG", data=svg, file_name="vectorized.svg",
+                               mime="image/svg+xml")
+            st.caption(f"Paths: {len(polylines)}  ·  Image: {gray.shape[1]}×{gray.shape[0]} px")
+        except Exception as e:
+            st.error(str(e))
+        finally:
+            pbar.progress(100, text="Ready")
