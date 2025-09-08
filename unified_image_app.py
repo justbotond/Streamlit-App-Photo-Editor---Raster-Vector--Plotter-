@@ -14,7 +14,7 @@ Design
 Run locally
 -----------
 1) Install deps (Python 3.9+ recommended):
-   pip install streamlit opencv-python-headless scikit-image svgwrite numpy pillow
+   pip install streamlit opencv-python-headless scikit-image svgwrite numpy pillow requests
 
 2) Start:
    streamlit run unified_image_app.py
@@ -50,6 +50,7 @@ except Exception as e:
 
 import svgwrite
 from PIL import Image
+import requests
 
 try:
     from skimage.morphology import skeletonize
@@ -72,12 +73,26 @@ def _ensure_uint8(img: np.ndarray) -> np.ndarray:
 def _to_bgr(img: np.ndarray) -> np.ndarray:
     return img if img.ndim == 3 and img.shape[2] == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-def load_image_to_bgr(file) -> np.ndarray:
-    data = file.read()
+def load_image_to_bgr_from_bytes(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("Could not decode image.")
+        raise ValueError("Could not decode image data.")
+    return img
+
+def load_image_to_bgr(file) -> np.ndarray:
+    return load_image_to_bgr_from_bytes(file.read())
+
+def load_image_from_url(url: str, timeout: float = 15.0) -> np.ndarray:
+    if not url or not isinstance(url, str):
+        raise ValueError("Empty URL.")
+    # Basic guard against non-http(s)
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise ValueError("URL must start with http:// or https://")
+    # Streamlit Cloud often blocks some hosts; handle HTTP errors cleanly
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    img = load_image_to_bgr_from_bytes(resp.content)
     return img
 
 def ensure_max_side(img: np.ndarray, max_side: int) -> np.ndarray:
@@ -95,28 +110,21 @@ def apply_basic(img_bgr: np.ndarray,
                 exposure: float, contrast: float,
                 highlights: float, shadows: float,
                 whites: float, blacks: float) -> np.ndarray:
-    # Convert to float for math
     img = img_bgr.astype(np.float32) / 255.0
-    # Exposure: scale around mid-gray
     img = np.clip(img * (2.0 ** exposure), 0, 1)
-    # Contrast: simple S-curve via gamma-like adjustment
     c = contrast
     if abs(c) > 1e-6:
-        # map [-1,1] → gamma in (~0.5, ~2) heuristic
         gamma = 1.0 / (1.0 + c) if c > 0 else 1.0 - c*0.5
         img = np.clip((img ** gamma), 0, 1)
-    # Convert to Lab to work on luminance
     lab = cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = lab[...,0], lab[...,1], lab[...,2]
     Ln = L / 255.0
-    # Highlights/Shadows tone curve
     if abs(highlights) > 1e-6:
         mask_h = np.clip((Ln - 0.5)*2, 0, 1)
         L = L + highlights*50.0*mask_h
     if abs(shadows) > 1e-6:
         mask_s = np.clip((0.5 - Ln)*2, 0, 1)
         L = L + shadows*50.0*mask_s
-    # Whites/Blacks ends
     if abs(whites) > 1e-6:
         L = np.clip(L + whites*40.0*np.power(np.clip(L/255.0,0,1), 2.0), 0, 255)
     if abs(blacks) > 1e-6:
@@ -128,7 +136,6 @@ def apply_basic(img_bgr: np.ndarray,
 # --- White balance & color ---
 
 def apply_white_balance(img_bgr: np.ndarray, temp: float, tint: float) -> np.ndarray:
-    # temp: [-100,100], tint: [-100,100]
     img = img_bgr.astype(np.float32)
     r_gain = 1.0 + 0.01*temp
     b_gain = 1.0 - 0.01*temp
@@ -149,10 +156,9 @@ def apply_vibrance_saturation(img_bgr: np.ndarray, vibrance: float, saturation: 
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.ndarray:
-    # HSL per hue bucket (reds, oranges, yellows, greens, aquas, blues, purples, magentas)
     hls = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HLS).astype(np.float32)
     H,L,S = hls[...,0], hls[...,1], hls[...,2]
-    Hn = (H * 2.0)  # OpenCV H in [0,180]; map to [0,360)
+    Hn = (H * 2.0)
     ranges = {
         'reds': [(345,360),(0,15)],
         'oranges': [(15,45)],
@@ -169,7 +175,7 @@ def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.
         for a,b in spans:
             if a <= b:
                 m |= ((H2 >= a) & (H2 < b)).astype(np.uint8)
-            else:  # wrap
+            else:
                 m |= ((H2 >= a) | (H2 < b)).astype(np.uint8)
         if name in h_adj:
             H2 = (H2 + m*h_adj[name]) % 360
@@ -185,11 +191,9 @@ def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.
 
 def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, texture: float, clarity: float, dehaze: float) -> np.ndarray:
     img = img_bgr.astype(np.float32)
-    # Noise reduction (luma) via fastNlMeans
     if noise_red > 0:
         h = 5 + int(noise_red*3)
         img = cv2.fastNlMeansDenoisingColored(_ensure_uint8(img), None, h, h, 7, 21).astype(np.float32)
-    # Clarity: local contrast via unsharp on LAB L channel
     if abs(clarity) > 1e-6:
         l = cv2.cvtColor(_ensure_uint8(img), cv2.COLOR_BGR2LAB).astype(np.float32)
         L = l[...,0]
@@ -198,17 +202,14 @@ def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, textu
         L = np.clip(L + clarity*high, 0, 255)
         l[...,0] = L
         img = cv2.cvtColor(l.astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
-    # Texture: high-frequency boost
     if abs(texture) > 1e-6:
         blur = cv2.GaussianBlur(_ensure_uint8(img), (0,0), 1.0)
         high = _ensure_uint8(img) - blur
         img = np.clip(img + texture*high, 0, 255)
-    # Sharpening: unsharp mask
     if sharpening > 0:
         sigma = 1.0 + 2.0*sharpening
         blur = cv2.GaussianBlur(_ensure_uint8(img), (0,0), sigma)
         img = np.clip(1.5*_ensure_uint8(img) - 0.5*blur, 0, 255)
-    # Dehaze: simple stretch in HSV V channel
     if abs(dehaze) > 1e-6:
         hsv = cv2.cvtColor(_ensure_uint8(img), cv2.COLOR_BGR2HSV).astype(np.float32)
         V = hsv[...,2]
@@ -225,11 +226,9 @@ def apply_crop_rotate(img_bgr: np.ndarray, angle_deg: float,
                       crop_l: float, crop_r: float, crop_t: float, crop_b: float,
                       target_aspect: float|None) -> np.ndarray:
     h, w = img_bgr.shape[:2]
-    # Rotate around center
     if abs(angle_deg) > 1e-3:
         M = cv2.getRotationMatrix2D((w/2, h/2), angle_deg, 1.0)
         img_bgr = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    # Crop by relative margins
     x0 = int(w*crop_l/100.0)
     x1 = int(w*(1.0 - crop_r/100.0))
     y0 = int(h*crop_t/100.0)
@@ -237,16 +236,15 @@ def apply_crop_rotate(img_bgr: np.ndarray, angle_deg: float,
     x0,x1 = max(0,x0), max(x0+1,min(w,x1))
     y0,y1 = max(0,y0), max(y0+1,min(h,y1))
     img_bgr = img_bgr[y0:y1, x0:x1]
-    # Aspect ratio fit (optional)
     if target_aspect and img_bgr.size:
         hh, ww = img_bgr.shape[:2]
         cur = ww/float(hh)
         if abs(cur - target_aspect) > 1e-3:
-            if cur > target_aspect:  # too wide → crop width
+            if cur > target_aspect:
                 new_w = int(target_aspect*hh)
                 off = (ww - new_w)//2
                 img_bgr = img_bgr[:, off:off+new_w]
-            else:                     # too tall → crop height
+            else:
                 new_h = int(ww/target_aspect)
                 off = (hh - new_h)//2
                 img_bgr = img_bgr[off:off+new_h, :]
@@ -258,7 +256,6 @@ def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float,
                         persp_x: float, persp_y: float) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     out = img_bgr.copy()
-    # Vignetting correction (radial brighten/darken)
     if abs(vignetting) > 1e-6:
         Y, X = np.ogrid[:h, :w]
         cx, cy = w/2, h/2
@@ -266,7 +263,6 @@ def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float,
         r /= r.max()
         mask = 1.0 + vignetting/100.0 * (1 - r)
         out = np.clip(out.astype(np.float32) * mask[...,None], 0, 255).astype(np.uint8)
-    # Chromatic aberration: shift channels
     if abs(ca_shift) > 1e-6:
         shift = int(round(ca_shift))
         def shift_channel(ch, dx, dy):
@@ -274,7 +270,6 @@ def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float,
             return cv2.warpAffine(ch, M, (w, h), borderMode=cv2.BORDER_REFLECT)
         b,g,r = cv2.split(out)
         out = cv2.merge([shift_channel(b,-shift,0), g, shift_channel(r,shift,0)])
-    # Barrel/Pincushion distortion (single k1 parameter)
     if abs(distortion) > 1e-6:
         k1 = distortion/10000.0
         xx, yy = np.meshgrid(np.linspace(-1,1,w), np.linspace(-1,1,h))
@@ -284,7 +279,6 @@ def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float,
         map_x = ((x_dist + 1)*0.5*(w-1)).astype(np.float32)
         map_y = ((y_dist + 1)*0.5*(h-1)).astype(np.float32)
         out = cv2.remap(out, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-    # Perspective (keystone) simple warp
     if abs(persp_x) > 1e-6 or abs(persp_y) > 1e-6:
         dx = w * persp_x / 100.0
         dy = h * persp_y / 100.0
@@ -596,12 +590,25 @@ with st.sidebar:
     app_mode = st.radio("Application", ["Photo Editor", "Raster → Vector"], index=0)
     st.divider()
 
+# Small helper to choose input source uniformly across modes
+def get_input_image_controls(accept_types: list[str], default_max_side: int):
+    st.subheader("Input")
+    input_source = st.radio("Image source", ["Upload", "Image URL"], horizontal=True, key=f"src_{app_mode}")
+    uploaded = None
+    url = ""
+    if input_source == "Upload":
+        uploaded = st.file_uploader("Upload an image", type=accept_types, key=f"uploader_{app_mode}")
+    else:
+        url = st.text_input("Paste direct image URL (http/https)", placeholder="https://example.com/photo.jpg", key=f"url_{app_mode}")
+    max_side = st.slider("Resize longest side (px)", 400, 4000, default_max_side, 100)
+    return input_source, uploaded, url, max_side
+
 # ------------------------------- PHOTO EDITOR --------------------------------
 if app_mode == "Photo Editor":
     with st.sidebar:
-        st.subheader("Input")
-        uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
-        max_side = st.slider("Resize longest side (px)", 400, 4000, 1600, 100)
+        input_source, uploaded, url, max_side = get_input_image_controls(
+            ["jpg","jpeg","png","bmp","tif","tiff","webp"], 1600
+        )
         st.subheader("Basic Adjustments")
         exposure = st.slider("Exposure (EV)", -2.0, 2.0, 0.0, 0.05)
         contrast = st.slider("Contrast", -0.9, 0.9, 0.0, 0.01)
@@ -669,14 +676,29 @@ if app_mode == "Photo Editor":
     col1, col2 = st.columns(2)
     pbar = st.progress(0, text="Waiting for image…")
 
-    if uploaded is None:
-        col1.info("Upload an image to begin")
+    img0 = None
+    load_err = None
+    if input_source == "Upload" and uploaded is not None:
+        try:
+            pbar.progress(5, text="Loading uploaded image…")
+            img0 = ensure_max_side(load_image_to_bgr(uploaded), max_side)
+        except Exception as e:
+            load_err = e
+    elif input_source == "Image URL" and url:
+        try:
+            pbar.progress(5, text="Downloading image from URL…")
+            img0 = ensure_max_side(load_image_from_url(url), max_side)
+        except Exception as e:
+            load_err = e
+
+    if img0 is None:
+        if load_err:
+            col1.error(f"Failed to load image: {load_err}")
+        col1.info("Upload an image or enter a URL to begin")
     else:
         def step(p, msg):
             pbar.progress(p, text=msg)
 
-        step(5, "Loading image…")
-        img0 = ensure_max_side(load_image_to_bgr(uploaded), max_side)
         col1.subheader("Original")
         col1.image(cv2.cvtColor(img0, cv2.COLOR_BGR2RGB), use_container_width=True)
 
@@ -710,11 +732,8 @@ if app_mode == "Photo Editor":
 # ------------------------------ RASTER→VECTOR --------------------------------
 else:
     with st.sidebar:
-        st.subheader("Input & Quality")
-        uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
-        max_side = st.slider(
-            "Resize longest side (px)", 400, 4000, 1400, 100,
-            help="Larger = more detail but slower."
+        input_source, uploaded, url, max_side = get_input_image_controls(
+            ["jpg","jpeg","png","bmp","tif","tiff","webp"], 1400
         )
 
         st.subheader("Vectorization")
@@ -739,13 +758,29 @@ else:
     col1, col2, col3 = st.columns(3)
     pbar = st.progress(0, text="Waiting for image…")
 
-    if uploaded is None:
-        col1.info("Upload an image to begin")
+    img_bgr = None
+    load_err = None
+    if input_source == "Upload" and uploaded is not None:
+        try:
+            pbar.progress(5, text="Loading uploaded image…")
+            img_bgr = ensure_max_side(load_image_to_bgr(uploaded), max_side)
+        except Exception as e:
+            load_err = e
+    elif input_source == "Image URL" and url:
+        try:
+            pbar.progress(5, text="Downloading image from URL…")
+            img_bgr = ensure_max_side(load_image_from_url(url), max_side)
+        except Exception as e:
+            load_err = e
+
+    if img_bgr is None:
+        if load_err:
+            col1.error(f"Failed to load image: {load_err}")
+        col1.info("Upload an image or enter a URL to begin")
     else:
         def step(pct, msg):
             pbar.progress(pct, text=msg)
 
-        img_bgr = ensure_max_side(load_image_to_bgr(uploaded), max_side)
         gray = to_grayscale(img_bgr)
 
         col1.subheader("Original")
@@ -772,7 +807,6 @@ else:
                 optimize=optimize,
             )
             col3.subheader("After (Vector preview)")
-            # Streamlit supports channels="BGR" for OpenCV arrays
             col3.image(preview, channels="BGR", use_container_width=True)
             st.divider()
             st.download_button("⬇️ Download SVG", data=svg, file_name="vectorized.svg", mime="image/svg+xml")
