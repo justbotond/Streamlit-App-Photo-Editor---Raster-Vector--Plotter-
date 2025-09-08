@@ -3,25 +3,25 @@
 Unified Streamlit App — Photo Editor + Raster→Vector (Plotter)
 
 • One app with two big features you can switch between from the sidebar
-  1) Photo Editor (Lightroom‑style controls) — live preview
+  1) Photo Editor (Lightroom-style controls) — live preview
   2) Raster → Vector (B/W) for pen plotters — live preview + SVG download
 
 Design
 - Sliders/toggles on the LEFT (sidebar), image previews in the MIDDLE columns
 - A progress bar shows the computation stage on every change
-- Uses Python end‑to‑end (OpenCV, NumPy, scikit‑image)
+- Uses Python end-to-end (OpenCV, NumPy, scikit-image)
 
 Run locally
 -----------
 1) Install deps (Python 3.9+ recommended):
-   pip install streamlit opencv-python scikit-image svgwrite numpy pillow
+   pip install streamlit opencv-python-headless scikit-image svgwrite numpy pillow
 
 2) Start:
    streamlit run unified_image_app.py
 
 Notes
-- This is a practical, offline‑friendly approximation of classic tools.
-- Local adjustment tools here include Radial & Graduated filters. A free‑hand brush
+- This is a practical, offline-friendly approximation of classic tools.
+- Local adjustment tools here include Radial & Graduated filters. A free-hand brush
   and AI subject/sky masks are not provided in this offline sample.
 """
 
@@ -30,8 +30,24 @@ import math
 from typing import List, Sequence, Tuple, Dict, Set
 
 import numpy as np
-import cv2
-import streamlit as st
+import streamlit as st  # import Streamlit first so we can render errors
+
+# Try OpenCV; show a helpful message if the headless wheel isn't installed
+try:
+    import cv2
+except Exception as e:
+    st.set_page_config(page_title="Unified Image App", layout="wide")
+    st.title("Unified Image App — Photo Editor & Raster→Vector")
+    st.error(
+        "OpenCV (cv2) is not available.\n\n"
+        "On Streamlit Cloud, you must depend on **opencv-python-headless** "
+        "instead of **opencv-python**. Update your `requirements.txt` to include:\n\n"
+        "    opencv-python-headless>=4.8\n\n"
+        "Remove `opencv-python` if present, then redeploy.\n\n"
+        f"Original import error: {type(e).__name__}: {e}"
+    )
+    st.stop()
+
 import svgwrite
 from PIL import Image
 
@@ -83,24 +99,24 @@ def apply_basic(img_bgr: np.ndarray,
     img = img_bgr.astype(np.float32) / 255.0
     # Exposure: scale around mid-gray
     img = np.clip(img * (2.0 ** exposure), 0, 1)
-    # Contrast: simple S-curve via gamma-like adjustment around 0.5
+    # Contrast: simple S-curve via gamma-like adjustment
     c = contrast
     if abs(c) > 1e-6:
-        # map [-1,1] → gamma in [0.5, 2]
+        # map [-1,1] → gamma in (~0.5, ~2) heuristic
         gamma = 1.0 / (1.0 + c) if c > 0 else 1.0 - c*0.5
         img = np.clip((img ** gamma), 0, 1)
-    # Convert to Lab to work on luminance for highlights/shadows/whites/blacks
+    # Convert to Lab to work on luminance
     lab = cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = lab[...,0], lab[...,1], lab[...,2]
     Ln = L / 255.0
-    # Highlights/Shadows tone curve (simple sigmoid blends)
+    # Highlights/Shadows tone curve
     if abs(highlights) > 1e-6:
         mask_h = np.clip((Ln - 0.5)*2, 0, 1)
         L = L + highlights*50.0*mask_h
     if abs(shadows) > 1e-6:
         mask_s = np.clip((0.5 - Ln)*2, 0, 1)
         L = L + shadows*50.0*mask_s
-    # Whites/Blacks: push top/bottom ends
+    # Whites/Blacks ends
     if abs(whites) > 1e-6:
         L = np.clip(L + whites*40.0*np.power(np.clip(L/255.0,0,1), 2.0), 0, 255)
     if abs(blacks) > 1e-6:
@@ -112,10 +128,8 @@ def apply_basic(img_bgr: np.ndarray,
 # --- White balance & color ---
 
 def apply_white_balance(img_bgr: np.ndarray, temp: float, tint: float) -> np.ndarray:
-    # temp: [-100,100] warm/cool, tint: [-100,100] magenta/green
+    # temp: [-100,100], tint: [-100,100]
     img = img_bgr.astype(np.float32)
-    # White balance gains (simple linear gains per channel)
-    # Map temp to blue/red gains; tint to green/magenta
     r_gain = 1.0 + 0.01*temp
     b_gain = 1.0 - 0.01*temp
     g_gain = 1.0 + 0.01*tint
@@ -124,10 +138,8 @@ def apply_white_balance(img_bgr: np.ndarray, temp: float, tint: float) -> np.nda
     return _ensure_uint8(out)
 
 def apply_vibrance_saturation(img_bgr: np.ndarray, vibrance: float, saturation: float) -> np.ndarray:
-    # Convert to HSV
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     H,S,V = hsv[...,0], hsv[...,1], hsv[...,2]
-    # Vibrance: boost saturation more for low‑sat pixels
     if abs(vibrance) > 1e-6:
         factor = 1.0 + (vibrance/100.0) * (1.0 - (S/255.0))
         S = np.clip(S * factor, 0, 255)
@@ -138,11 +150,9 @@ def apply_vibrance_saturation(img_bgr: np.ndarray, vibrance: float, saturation: 
 
 def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.ndarray:
     # HSL per hue bucket (reds, oranges, yellows, greens, aquas, blues, purples, magentas)
-    # Convert to HLS (OpenCV uses HLS not HSL; similar)
     hls = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HLS).astype(np.float32)
     H,L,S = hls[...,0], hls[...,1], hls[...,2]
     Hn = (H * 2.0)  # OpenCV H in [0,180]; map to [0,360)
-    # Define hue ranges
     ranges = {
         'reds': [(345,360),(0,15)],
         'oranges': [(15,45)],
@@ -153,14 +163,13 @@ def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.
         'purples': [(255,285)],
         'magentas': [(285,345)],
     }
-    mask_total = np.zeros_like(H, dtype=np.float32)
     H2 = Hn
     for name, spans in ranges.items():
         m = np.zeros_like(H, dtype=np.uint8)
         for a,b in spans:
             if a <= b:
                 m |= ((H2 >= a) & (H2 < b)).astype(np.uint8)
-            else: # wrap
+            else:  # wrap
                 m |= ((H2 >= a) | (H2 < b)).astype(np.uint8)
         if name in h_adj:
             H2 = (H2 + m*h_adj[name]) % 360
@@ -168,7 +177,6 @@ def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.
             S = np.clip(S * (1.0 + (m*s_adj[name]/100.0)), 0, 255)
         if name in l_adj:
             L = np.clip(L + (m*l_adj[name]), 0, 255)
-        mask_total += m
     H_out = (H2/2.0).astype(np.float32)
     out = cv2.cvtColor(np.stack([H_out,L,S], axis=-1).astype(np.uint8), cv2.COLOR_HLS2BGR)
     return out
@@ -177,11 +185,11 @@ def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.
 
 def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, texture: float, clarity: float, dehaze: float) -> np.ndarray:
     img = img_bgr.astype(np.float32)
-    # Noise reduction (luma) via bilateral or fastNlMeans
+    # Noise reduction (luma) via fastNlMeans
     if noise_red > 0:
         h = 5 + int(noise_red*3)
         img = cv2.fastNlMeansDenoisingColored(_ensure_uint8(img), None, h, h, 7, 21).astype(np.float32)
-    # Clarity: local contrast via unsharp on midtones
+    # Clarity: local contrast via unsharp on LAB L channel
     if abs(clarity) > 1e-6:
         l = cv2.cvtColor(_ensure_uint8(img), cv2.COLOR_BGR2LAB).astype(np.float32)
         L = l[...,0]
@@ -190,7 +198,7 @@ def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, textu
         L = np.clip(L + clarity*high, 0, 255)
         l[...,0] = L
         img = cv2.cvtColor(l.astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
-    # Texture: high‑frequency boost
+    # Texture: high-frequency boost
     if abs(texture) > 1e-6:
         blur = cv2.GaussianBlur(_ensure_uint8(img), (0,0), 1.0)
         high = _ensure_uint8(img) - blur
@@ -200,7 +208,7 @@ def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, textu
         sigma = 1.0 + 2.0*sharpening
         blur = cv2.GaussianBlur(_ensure_uint8(img), (0,0), sigma)
         img = np.clip(1.5*_ensure_uint8(img) - 0.5*blur, 0, 255)
-    # Dehaze: simple contrast‑limited stretch in HSV V channel
+    # Dehaze: simple stretch in HSV V channel
     if abs(dehaze) > 1e-6:
         hsv = cv2.cvtColor(_ensure_uint8(img), cv2.COLOR_BGR2HSV).astype(np.float32)
         V = hsv[...,2]
@@ -296,7 +304,6 @@ def apply_radial_filter(img_bgr: np.ndarray, cx: float, cy: float, rx: float, ry
     mask = (((X-cxp)/rxs)**2 + ((Y-cyp)/rys)**2)
     mask = np.clip(1.0 - mask, 0.0, 1.0)
     mask = cv2.GaussianBlur(mask, (0,0), 15)
-    # Brightness exposure style
     factor = 1.0 + strength/100.0
     out = img_bgr.astype(np.float32)
     out = out*(1-mask[...,None]) + np.clip(out*factor,0,255)*mask[...,None]
@@ -305,10 +312,8 @@ def apply_radial_filter(img_bgr: np.ndarray, cx: float, cy: float, rx: float, ry
 def apply_graduated_filter(img_bgr: np.ndarray, angle_deg: float, pos: float, feather: float, strength: float) -> np.ndarray:
     h, w = img_bgr.shape[:2]
     Y, X = np.mgrid[0:h, 0:w].astype(np.float32)
-    # Create a gradient mask line at position pos from top (0..1)
     theta = np.deg2rad(angle_deg)
     nx, ny = np.cos(theta), np.sin(theta)
-    # line passing through (w/2, h*pos)
     d = (X - w/2)*nx + (Y - h*pos)*ny
     mask = 0.5 - d / (max(w,h) * (feather/100.0) + 1e-6)
     mask = np.clip(mask, 0, 1)
@@ -633,7 +638,7 @@ if app_mode == "Photo Editor":
         crop_r = st.slider("Crop Right %", 0.0, 40.0, 0.0, 0.5)
         crop_t = st.slider("Crop Top %", 0.0, 40.0, 0.0, 0.5)
         crop_b = st.slider("Crop Bottom %", 0.0, 40.0, 0.0, 0.5)
-        aspect = st.selectbox("Aspect Ratio", ["Original","1:1","4:5","3:2","16:9"]) 
+        aspect = st.selectbox("Aspect Ratio", ["Original","1:1","4:5","3:2","16:9"])
         aspect_map = {"Original": None, "1:1": 1.0, "4:5": 4/5, "3:2": 3/2, "16:9": 16/9}
         target_aspect = aspect_map[aspect]
 
@@ -651,15 +656,15 @@ if app_mode == "Photo Editor":
             rx = st.slider("Radius X", 0.05, 1.0, 0.35, 0.01)
             ry = st.slider("Radius Y", 0.05, 1.0, 0.25, 0.01)
             radial_strength = st.slider(
-    "Exposure Strength (Radial)", -100.0, 100.0, 0.0, 1.0, key="pe_radial_strength"
-)
+                "Exposure Strength (Radial)", -100.0, 100.0, 0.0, 1.0, key="pe_radial_strength"
+            )
         with st.expander("Graduated Filter"):
             grad_angle = st.slider("Angle", -180.0, 180.0, 0.0, 1.0)
             grad_pos = st.slider("Position (0=top)", 0.0, 1.0, 0.5, 0.01)
             grad_feather = st.slider("Feather %", 1.0, 100.0, 50.0, 1.0)
             grad_strength = st.slider(
-    "Exposure Strength (Graduated)", -100.0, 100.0, 0.0, 1.0, key="pe_grad_strength"
-)
+                "Exposure Strength (Graduated)", -100.0, 100.0, 0.0, 1.0, key="pe_grad_strength"
+            )
 
     col1, col2 = st.columns(2)
     pbar = st.progress(0, text="Waiting for image…")
@@ -706,9 +711,11 @@ if app_mode == "Photo Editor":
 else:
     with st.sidebar:
         st.subheader("Input & Quality")
-        uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"]) 
-        max_side = st.slider("Resize longest side (px)", 400, 4000, 1400, 100,
-                             help="Larger = more detail but slower.")
+        uploaded = st.file_uploader("Upload an image", type=["jpg","jpeg","png","bmp","tif","tiff","webp"])
+        max_side = st.slider(
+            "Resize longest side (px)", 400, 4000, 1400, 100,
+            help="Larger = more detail but slower."
+        )
 
         st.subheader("Vectorization")
         mode = st.radio("Mode", ["centerline","outline"], index=0, help="Centerline=skeleton; Outline=contours")
@@ -725,8 +732,7 @@ else:
         stroke_mm = st.slider("Stroke preview", 0.0, 2.0, 0.35, 0.05)
 
         st.subheader("Simplify / Filter")
-        simplify_eps_mm = st.slider("Simplify epsilon", 0.0, 5.0, 0.5, 0.05,
-                                    help="Higher = fewer nodes")
+        simplify_eps_mm = st.slider("Simplify epsilon", 0.0, 5.0, 0.5, 0.05, help="Higher = fewer nodes")
         min_len_mm = st.slider("Min path length", 0.0, 20.0, 2.0, 0.5)
         optimize = st.checkbox("Optimize pen-up travel", value=True)
 
@@ -766,10 +772,10 @@ else:
                 optimize=optimize,
             )
             col3.subheader("After (Vector preview)")
+            # Streamlit supports channels="BGR" for OpenCV arrays
             col3.image(preview, channels="BGR", use_container_width=True)
             st.divider()
-            st.download_button("⬇️ Download SVG", data=svg, file_name="vectorized.svg",
-                               mime="image/svg+xml")
+            st.download_button("⬇️ Download SVG", data=svg, file_name="vectorized.svg", mime="image/svg+xml")
             st.caption(f"Paths: {len(polylines)}  ·  Image: {gray.shape[1]}×{gray.shape[0]} px")
         except Exception as e:
             st.error(str(e))
