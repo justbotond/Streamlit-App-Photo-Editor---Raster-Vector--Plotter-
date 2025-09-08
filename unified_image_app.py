@@ -2,27 +2,15 @@
 """
 Unified Streamlit App — Photo Editor + Raster→Vector (Plotter)
 
-• One app with two big features you can switch between from the sidebar
-  1) Photo Editor (Lightroom-style controls) — live preview
-  2) Raster → Vector (B/W) for pen plotters — live preview + SVG download
-
-Design
-- Sliders/toggles on the LEFT (sidebar), image previews in the MIDDLE columns
-- A progress bar shows the computation stage on every change
-- Uses Python end-to-end (OpenCV, NumPy, scikit-image)
-
-Run locally
------------
-1) Install deps (Python 3.9+ recommended):
-   pip install streamlit opencv-python-headless scikit-image svgwrite numpy pillow requests
-
-2) Start:
-   streamlit run unified_image_app.py
+Features
+- Photo Editor (Lightroom-style) with:
+  • Upload or Image URL
+  • ✨ Auto Grade button (automatic color grading)
+  • ↩️ Reset button (shows original image)
+- Raster → Vector for pen plotters, SVG download
 
 Notes
-- This is a practical, offline-friendly approximation of classic tools.
-- Local adjustment tools here include Radial & Graduated filters. A free-hand brush
-  and AI subject/sky masks are not provided in this offline sample.
+- Use opencv-python-headless on Streamlit Cloud.
 """
 
 from __future__ import annotations
@@ -40,8 +28,8 @@ except Exception as e:
     st.title("Unified Image App — Photo Editor & Raster→Vector")
     st.error(
         "OpenCV (cv2) is not available.\n\n"
-        "On Streamlit Cloud, you must depend on **opencv-python-headless** "
-        "instead of **opencv-python**. Update your `requirements.txt` to include:\n\n"
+        "On Streamlit Cloud, depend on **opencv-python-headless** (not opencv-python).\n"
+        "Update your `requirements.txt` to include:\n\n"
         "    opencv-python-headless>=4.8\n\n"
         "Remove `opencv-python` if present, then redeploy.\n\n"
         f"Original import error: {type(e).__name__}: {e}"
@@ -51,6 +39,7 @@ except Exception as e:
 import svgwrite
 from PIL import Image
 import requests
+import streamlit.components.v1 as components
 
 try:
     from skimage.morphology import skeletonize
@@ -62,6 +51,29 @@ Point = Tuple[int, int]
 FloatPoint = Tuple[float, float]
 Polyline = List[FloatPoint]
 
+# ============================== AdSense Helper ===============================
+
+def render_adsense(slot_key: str, *, height: int = 120):
+    """Render a responsive AdSense slot if secrets are provided."""
+    ads = st.secrets.get("adsense", {})
+    client = ads.get("client")
+    slot = ads.get(slot_key)
+    if not client or not slot:
+        return
+    components.html(
+        f"""
+        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={client}" crossorigin="anonymous"></script>
+        <ins class="adsbygoogle"
+            style="display:block"
+            data-ad-client="{client}"
+            data-ad-slot="{slot}"
+            data-ad-format="auto"
+            data-full-width-responsive="true"></ins>
+        <script>(adsbygoogle = window.adsbygoogle || []).push({{}});</script>
+        """,
+        height=height,
+    )
+
 # ============================== Utility Helpers ==============================
 
 def _ensure_uint8(img: np.ndarray) -> np.ndarray:
@@ -69,9 +81,6 @@ def _ensure_uint8(img: np.ndarray) -> np.ndarray:
     if img.dtype != np.uint8:
         img = img.astype(np.uint8)
     return img
-
-def _to_bgr(img: np.ndarray) -> np.ndarray:
-    return img if img.ndim == 3 and img.shape[2] == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
 def load_image_to_bgr_from_bytes(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, dtype=np.uint8)
@@ -86,14 +95,11 @@ def load_image_to_bgr(file) -> np.ndarray:
 def load_image_from_url(url: str, timeout: float = 15.0) -> np.ndarray:
     if not url or not isinstance(url, str):
         raise ValueError("Empty URL.")
-    # Basic guard against non-http(s)
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ValueError("URL must start with http:// or https://")
-    # Streamlit Cloud often blocks some hosts; handle HTTP errors cleanly
     resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
     resp.raise_for_status()
-    img = load_image_to_bgr_from_bytes(resp.content)
-    return img
+    return load_image_to_bgr_from_bytes(resp.content)
 
 def ensure_max_side(img: np.ndarray, max_side: int) -> np.ndarray:
     h, w = img.shape[:2]
@@ -103,8 +109,6 @@ def ensure_max_side(img: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
 # =============================== Photo Editor ================================
-
-# --- Basic global adjustments ---
 
 def apply_basic(img_bgr: np.ndarray,
                 exposure: float, contrast: float,
@@ -132,8 +136,6 @@ def apply_basic(img_bgr: np.ndarray,
     lab = np.stack([np.clip(L,0,255), A, B], axis=-1)
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     return out
-
-# --- White balance & color ---
 
 def apply_white_balance(img_bgr: np.ndarray, temp: float, tint: float) -> np.ndarray:
     img = img_bgr.astype(np.float32)
@@ -187,8 +189,6 @@ def apply_hsl(img_bgr: np.ndarray, h_adj: dict, s_adj: dict, l_adj: dict) -> np.
     out = cv2.cvtColor(np.stack([H_out,L,S], axis=-1).astype(np.uint8), cv2.COLOR_HLS2BGR)
     return out
 
-# --- Detail & sharpness ---
-
 def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, texture: float, clarity: float, dehaze: float) -> np.ndarray:
     img = img_bgr.astype(np.float32)
     if noise_red > 0:
@@ -220,8 +220,6 @@ def apply_detail(img_bgr: np.ndarray, sharpening: float, noise_red: float, textu
         img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
     return _ensure_uint8(img)
 
-# --- Crop, rotate, aspect ---
-
 def apply_crop_rotate(img_bgr: np.ndarray, angle_deg: float,
                       crop_l: float, crop_r: float, crop_t: float, crop_b: float,
                       target_aspect: float|None) -> np.ndarray:
@@ -249,8 +247,6 @@ def apply_crop_rotate(img_bgr: np.ndarray, angle_deg: float,
                 off = (hh - new_h)//2
                 img_bgr = img_bgr[off:off+new_h, :]
     return img_bgr
-
-# --- Lens & geometry corrections (simple) ---
 
 def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float, distortion: float,
                         persp_x: float, persp_y: float) -> np.ndarray:
@@ -288,36 +284,6 @@ def apply_lens_geometry(img_bgr: np.ndarray, vignetting: float, ca_shift: float,
         out = cv2.warpPerspective(out, M, (w,h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
     return out
 
-# --- Local adjustments: radial & graduated filters ---
-
-def apply_radial_filter(img_bgr: np.ndarray, cx: float, cy: float, rx: float, ry: float, strength: float) -> np.ndarray:
-    h, w = img_bgr.shape[:2]
-    Y, X = np.ogrid[:h, :w]
-    cxp, cyp = w*cx, h*cy
-    rxs, rys = max(1,w*rx), max(1,h*ry)
-    mask = (((X-cxp)/rxs)**2 + ((Y-cyp)/rys)**2)
-    mask = np.clip(1.0 - mask, 0.0, 1.0)
-    mask = cv2.GaussianBlur(mask, (0,0), 15)
-    factor = 1.0 + strength/100.0
-    out = img_bgr.astype(np.float32)
-    out = out*(1-mask[...,None]) + np.clip(out*factor,0,255)*mask[...,None]
-    return _ensure_uint8(out)
-
-def apply_graduated_filter(img_bgr: np.ndarray, angle_deg: float, pos: float, feather: float, strength: float) -> np.ndarray:
-    h, w = img_bgr.shape[:2]
-    Y, X = np.mgrid[0:h, 0:w].astype(np.float32)
-    theta = np.deg2rad(angle_deg)
-    nx, ny = np.cos(theta), np.sin(theta)
-    d = (X - w/2)*nx + (Y - h*pos)*ny
-    mask = 0.5 - d / (max(w,h) * (feather/100.0) + 1e-6)
-    mask = np.clip(mask, 0, 1)
-    factor = 1.0 + strength/100.0
-    out = img_bgr.astype(np.float32)
-    out = out*(1-mask[...,None]) + np.clip(out*factor,0,255)*mask[...,None]
-    return _ensure_uint8(out)
-
-# ============================ Raster→Vector bits =============================
-
 def to_grayscale(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -340,8 +306,6 @@ def threshold_bw(gray: np.ndarray,
     if invert:
         th = cv2.bitwise_not(th)
     return th
-
-# --- Geometry helpers for vectorization ---
 
 def polyline_length_px(poly: Sequence[FloatPoint]) -> float:
     if len(poly) < 2:
@@ -366,8 +330,6 @@ def find_outline_polylines(binary: np.ndarray,
         if polyline_length_px(pts) >= min_len_px:
             polylines.append(pts)
     return polylines
-
-# centerline
 
 def neighbors8(p: Point) -> List[Point]:
     x, y = p
@@ -483,8 +445,6 @@ def trace_skeleton_to_polylines(skel: np.ndarray,
                         polylines.append(poly)
     return polylines
 
-# Ordering & SVG
-
 def nearest_order(polys: List[Polyline]) -> List[Polyline]:
     if not polys:
         return polys
@@ -540,50 +500,42 @@ def svg_bytes(polylines: List[Polyline],
                              stroke_linecap="round", stroke_linejoin="round"))
     return dwg.tostring().encode("utf-8")
 
-# Vectorization stepper with progress
+# ============================ Auto Color Grading ==============================
 
-def vectorize_with_progress(gray: np.ndarray, progress_cb, *,
-                            mode: str, thr_method: str, invert: bool, blur_ksize: int,
-                            block_size: int, C: int,
-                            width_mm: float, height_mm_opt: float, margin_mm: float,
-                            simplify_eps_mm: float, min_len_mm: float,
-                            stroke_mm: float, optimize: bool):
-    progress_cb(10, "Thresholding…")
-    binary = threshold_bw(gray, method=thr_method, block_size=block_size, C=C,
-                          invert=invert, blur_ksize=blur_ksize, use_otsu=(thr_method=="otsu"))
-    progress_cb(25, "Preparing geometry…")
-    h, w = gray.shape
-    avail_w = max(1e-6, width_mm - 2*margin_mm)
-    px_per_mm = w / avail_w
-    simplify_eps_px = max(0.0, simplify_eps_mm * px_per_mm)
-    min_len_px = max(0.0, min_len_mm * px_per_mm)
-    if mode == "outline":
-        progress_cb(55, "Tracing contours…")
-        polylines = find_outline_polylines(binary, simplify_eps_px, min_len_px)
-    else:
-        if skeletonize is None:
-            raise RuntimeError("Install scikit-image for centerline mode: pip install scikit-image")
-        progress_cb(45, "Skeletonizing…")
-        skel = skeletonize(binary > 0).astype(np.uint8) * 255
-        progress_cb(65, "Tracing centerlines…")
-        polylines = trace_skeleton_to_polylines(skel, simplify_eps_px, min_len_px)
-    progress_cb(80, "Rendering preview…")
-    preview = np.zeros((h, w, 3), dtype=np.uint8)
-    px_thick = max(1, int(round(stroke_mm * 2)))
-    for poly in polylines:
-        if len(poly) >= 2:
-            pts = np.array(poly, dtype=np.int32)
-            cv2.polylines(preview, [pts], isClosed=False, color=(255,255,255), thickness=px_thick)
-    progress_cb(95, "Building SVG…")
-    height_mm = None if height_mm_opt <= 0 else height_mm_opt
-    svg = svg_bytes(polylines, w, h, width_mm, height_mm, margin_mm, stroke_mm, optimize)
-    progress_cb(100, "Done")
-    return binary, polylines, preview, svg
+def auto_color_grade(img_bgr: np.ndarray) -> np.ndarray:
+    """Simple auto color grading:
+    1) Gray-world white balance
+    2) CLAHE on LAB L channel
+    3) Gentle saturation boost
+    """
+    img = img_bgr.astype(np.float32)
+    # 1) Gray-world WB
+    means = img.reshape(-1, 3).mean(axis=0) + 1e-6
+    g_mean = float(means.mean())
+    gains = g_mean / means
+    img = np.clip(img * gains[None, None, :], 0, 255).astype(np.uint8)
+
+    # 2) CLAHE on L
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+    Lc = clahe.apply(L)
+    lab2 = cv2.merge([Lc, A, B])
+    img2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
+    # 3) gentle saturation boost
+    hsv = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[...,1] = np.clip(hsv[...,1] * 1.08, 0, 255)
+    out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return out
 
 # ================================ UI LAYOUT ==================================
 
 st.set_page_config(page_title="Unified Image App", layout="wide")
 st.title("Unified Image App — Photo Editor & Raster→Vector")
+
+# Top AdSense slot
+render_adsense("slot_top", height=120)
 
 with st.sidebar:
     st.header("Choose Feature")
@@ -609,6 +561,19 @@ if app_mode == "Photo Editor":
         input_source, uploaded, url, max_side = get_input_image_controls(
             ["jpg","jpeg","png","bmp","tif","tiff","webp"], 1600
         )
+
+        # Auto/Reset buttons
+        c1, c2 = st.columns(2)
+        auto_btn = c1.button("✨ Auto Grade", use_container_width=True)
+        reset_btn = c2.button("↩️ Reset", use_container_width=True)
+
+        # Remember user's intent in session_state
+        if reset_btn:
+            st.session_state["pe_force_original"] = True
+        if auto_btn:
+            st.session_state["pe_force_original"] = False
+            st.session_state["pe_do_auto"] = True
+
         st.subheader("Basic Adjustments")
         exposure = st.slider("Exposure (EV)", -2.0, 2.0, 0.0, 0.05)
         contrast = st.slider("Contrast", -0.9, 0.9, 0.0, 0.01)
@@ -676,8 +641,7 @@ if app_mode == "Photo Editor":
     col1, col2 = st.columns(2)
     pbar = st.progress(0, text="Waiting for image…")
 
-    img0 = None
-    load_err = None
+    img0, load_err = None, None
     if input_source == "Upload" and uploaded is not None:
         try:
             pbar.progress(5, text="Loading uploaded image…")
@@ -696,38 +660,46 @@ if app_mode == "Photo Editor":
             col1.error(f"Failed to load image: {load_err}")
         col1.info("Upload an image or enter a URL to begin")
     else:
-        def step(p, msg):
-            pbar.progress(p, text=msg)
-
         col1.subheader("Original")
         col1.image(cv2.cvtColor(img0, cv2.COLOR_BGR2RGB), use_container_width=True)
 
-        step(15, "Basic adjustments…")
-        img = apply_basic(img0, exposure, contrast, highlights, shadows, whites, blacks)
+        # Decide pipeline path: Reset → show original; Auto → auto grade; else sliders pipeline
+        if st.session_state.get("pe_force_original", False):
+            pbar.progress(100, text="Showing original (Reset)")
+            col2.subheader("Edited (Reset)")
+            col2.image(cv2.cvtColor(img0, cv2.COLOR_BGR2RGB), use_container_width=True)
+        elif st.session_state.get("pe_do_auto", False):
+            pbar.progress(25, text="Auto color grading…")
+            auto_img = auto_color_grade(img0)
+            pbar.progress(100, text="Done (Auto)")
+            col2.subheader("Edited (Auto Grade)")
+            col2.image(cv2.cvtColor(auto_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+            # Auto is one-shot; clear flag so subsequent slider changes apply normally
+            st.session_state["pe_do_auto"] = False
+        else:
+            def step(p, msg):
+                pbar.progress(p, text=msg)
 
-        step(30, "White balance & color…")
-        img = apply_white_balance(img, temp, tint)
-        img = apply_vibrance_saturation(img, vibrance, saturation)
-        img = apply_hsl(img, h_adj, s_adj, l_adj)
+            step(15, "Basic adjustments…")
+            img = apply_basic(img0, exposure, contrast, highlights, shadows, whites, blacks)
 
-        step(55, "Detail & sharpness…")
-        img = apply_detail(img, sharpening, noise_red, texture, clarity, dehaze)
+            step(30, "White balance & color…")
+            img = apply_white_balance(img, temp, tint)
+            img = apply_vibrance_saturation(img, vibrance, saturation)
+            img = apply_hsl(img, h_adj, s_adj, l_adj)
 
-        step(70, "Lens & geometry…")
-        img = apply_lens_geometry(img, vignetting, ca_shift, distortion, persp_x, persp_y)
+            step(55, "Detail & sharpness…")
+            img = apply_detail(img, sharpening, noise_red, texture, clarity, dehaze)
 
-        step(82, "Local adjustments…")
-        if abs(radial_strength) > 1e-6:
-            img = apply_radial_filter(img, cx, cy, rx, ry, radial_strength)
-        if abs(grad_strength) > 1e-6:
-            img = apply_graduated_filter(img, grad_angle, grad_pos, grad_feather, grad_strength)
+            step(70, "Lens & geometry…")
+            img = apply_lens_geometry(img, vignetting, ca_shift, distortion, persp_x, persp_y)
 
-        step(90, "Crop & straighten…")
-        img = apply_crop_rotate(img, angle, crop_l, crop_r, crop_t, crop_b, target_aspect)
+            step(90, "Crop & straighten…")
+            img = apply_crop_rotate(img, angle, crop_l, crop_r, crop_t, crop_b, target_aspect)
 
-        step(100, "Done")
-        col2.subheader("Edited")
-        col2.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
+            step(100, "Done")
+            col2.subheader("Edited")
+            col2.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
 
 # ------------------------------ RASTER→VECTOR --------------------------------
 else:
@@ -758,8 +730,7 @@ else:
     col1, col2, col3 = st.columns(3)
     pbar = st.progress(0, text="Waiting for image…")
 
-    img_bgr = None
-    load_err = None
+    img_bgr, load_err = None, None
     if input_source == "Upload" and uploaded is not None:
         try:
             pbar.progress(5, text="Loading uploaded image…")
@@ -790,6 +761,45 @@ else:
         col2.image(gray, clamp=True, use_container_width=True)
 
         try:
+            # Vectorize (function defined above Photo Editor in original code)
+            def vectorize_with_progress(gray: np.ndarray, progress_cb, *,
+                                        mode: str, thr_method: str, invert: bool, blur_ksize: int,
+                                        block_size: int, C: int,
+                                        width_mm: float, height_mm_opt: float, margin_mm: float,
+                                        simplify_eps_mm: float, min_len_mm: float,
+                                        stroke_mm: float, optimize: bool):
+                progress_cb(10, "Thresholding…")
+                binary = threshold_bw(gray, method=thr_method, block_size=block_size, C=C,
+                                      invert=invert, blur_ksize=blur_ksize, use_otsu=(thr_method=="otsu"))
+                progress_cb(25, "Preparing geometry…")
+                h, w = gray.shape
+                avail_w = max(1e-6, width_mm - 2*margin_mm)
+                px_per_mm = w / avail_w
+                simplify_eps_px = max(0.0, simplify_eps_mm * px_per_mm)
+                min_len_px = max(0.0, min_len_mm * px_per_mm)
+                if mode == "outline":
+                    progress_cb(55, "Tracing contours…")
+                    polylines = find_outline_polylines(binary, simplify_eps_px, min_len_px)
+                else:
+                    if skeletonize is None:
+                        raise RuntimeError("Install scikit-image for centerline mode: pip install scikit-image")
+                    progress_cb(45, "Skeletonizing…")
+                    skel = skeletonize(binary > 0).astype(np.uint8) * 255
+                    progress_cb(65, "Tracing centerlines…")
+                    polylines = trace_skeleton_to_polylines(skel, simplify_eps_px, min_len_px)
+                progress_cb(80, "Rendering preview…")
+                preview = np.zeros((h, w, 3), dtype=np.uint8)
+                px_thick = max(1, int(round(stroke_mm * 2)))
+                for poly in polylines:
+                    if len(poly) >= 2:
+                        pts = np.array(poly, dtype=np.int32)
+                        cv2.polylines(preview, [pts], isClosed=False, color=(255,255,255), thickness=px_thick)
+                progress_cb(95, "Building SVG…")
+                height_mm = None if height_mm_opt <= 0 else height_mm_opt
+                svg = svg_bytes(polylines, w, h, width_mm, height_mm, margin_mm, stroke_mm, optimize)
+                progress_cb(100, "Done")
+                return binary, polylines, preview, svg
+
             binary, polylines, preview, svg = vectorize_with_progress(
                 gray, step,
                 mode=mode,
@@ -815,3 +825,7 @@ else:
             st.error(str(e))
         finally:
             pbar.progress(100, text="Ready")
+
+# Bottom AdSense slot
+st.divider()
+render_adsense("slot_bottom", height=120)
