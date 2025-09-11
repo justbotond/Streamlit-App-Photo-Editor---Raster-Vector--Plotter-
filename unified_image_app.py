@@ -51,28 +51,30 @@ Point = Tuple[int, int]
 FloatPoint = Tuple[float, float]
 Polyline = List[FloatPoint]
 
-# ============================== AdSense Helper ===============================
+# ============================== Auto Ads (no slot IDs) =======================
 
-def render_adsense(slot_key: str, *, height: int = 120):
-    """Render a responsive AdSense slot if secrets are provided."""
-    ads = st.secrets.get("adsense", {})
-    client = ads.get("client")
-    slot = ads.get(slot_key)
-    if not client or not slot:
+def enable_adsense_auto_ads(client_id: str | None = None):
+    """
+    Loads Google's Auto ads script once. No ad unit slot IDs needed.
+    - Uses st.secrets['adsense']['client'] if present
+    - Falls back to your client: ca-pub-6172259113695306
+    """
+    client = (
+        client_id
+        or st.secrets.get("adsense", {}).get("client")
+        or "ca-pub-6172259113695306"
+    )
+    if st.session_state.get("_adsense_auto_injected"):
         return
     components.html(
         f"""
-        <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={client}" crossorigin="anonymous"></script>
-        <ins class="adsbygoogle"
-            style="display:block"
-            data-ad-client="{client}"
-            data-ad-slot="{slot}"
-            data-ad-format="auto"
-            data-full-width-responsive="true"></ins>
-        <script>(adsbygoogle = window.adsbygoogle || []).push({{}});</script>
+        <script async
+            src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={client}"
+            crossorigin="anonymous"></script>
         """,
-        height=height,
+        height=0,
     )
+    st.session_state["_adsense_auto_injected"] = True
 
 # ============================== Utility Helpers ==============================
 
@@ -534,8 +536,8 @@ def auto_color_grade(img_bgr: np.ndarray) -> np.ndarray:
 st.set_page_config(page_title="Unified Image App", layout="wide")
 st.title("Unified Image App — Photo Editor & Raster→Vector")
 
-# Top AdSense slot
-render_adsense("slot_top", height=120)
+# Enable Google Auto ads (no slot IDs needed)
+enable_adsense_auto_ads()
 
 with st.sidebar:
     st.header("Choose Feature")
@@ -826,6 +828,3 @@ else:
         finally:
             pbar.progress(100, text="Ready")
 
-# Bottom AdSense slot
-st.divider()
-render_adsense("slot_bottom", height=120)
