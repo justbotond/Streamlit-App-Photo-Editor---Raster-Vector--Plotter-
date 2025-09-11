@@ -74,6 +74,10 @@ def enable_adsense_auto_ads(client_id: str | None = None):
         """,
         height=0,
     )
+    # (Optional/ineffective) meta tag shown inside an iframe — not in page <head>
+    components.html(
+        '<meta name="google-adsense-account" content="ca-pub-6172259113695306">', height=0
+    )
     st.session_state["_adsense_auto_injected"] = True
 
 # ============================== Utility Helpers ==============================
